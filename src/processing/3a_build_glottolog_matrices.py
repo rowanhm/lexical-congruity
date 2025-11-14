@@ -87,22 +87,13 @@ def main():
     """
     Main function to load data, compute matrices, and save files.
     """
-    if not PREDEFINED_LANGUAGES:
-        print("Error: The 'PREDEFINED_LANGUAGES' list is empty.")
-        print("Please add Glottocodes to the list at the top of the script.")
-        return
-
-    if not CLDF_METADATA_FILE.exists():
-        print(f"Error: Could not find CLDF metadata file at:")
-        print(f"{CLDF_METADATA_FILE.resolve()}")
-        print("Please check the 'GLOTTOLOG_DIR' path.")
-        return
 
     # Ensure output directory exists
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # --- 1. Load Glottolog Data ---
     print(f"Loading Glottolog data from {CLDF_METADATA_FILE}...")
+
     try:
         ds = Dataset.from_metadata(CLDF_METADATA_FILE)
         languages_table = list(ds.iter_rows('LanguageTable'))
@@ -111,17 +102,38 @@ def main():
         print("Please ensure 'pycldf' is installed (`pip install pycldf`).")
         return
 
-    # Create a lookup dictionary for the languages we care about
+    # --- Create a lookup dictionary for the languages we care about ---
+    print("Processing languoid data...")
     lang_data = {}
     predefined_set = set(PREDEFINED_LANGUAGES)
 
+    # 1. Load classification data from ValueTable
+    print("Loading classification data from ValueTable...")
+    try:
+        values_table = list(ds.iter_rows('ValueTable'))
+    except Exception as e:
+        print(f"Error loading ValueTable: {e}")
+        print("Please ensure your CLDF dataset includes a values.csv component.")
+        return
+
+    classification_map = {}
+    for row in tqdm(values_table, desc="Parsing values"):
+        if row.get('Parameter_ID') == 'classification':
+            # Language_ID in ValueTable links to ID in LanguageTable
+            classification_map[row.get('Language_ID')] = row.get('Value')
+    print(f"Found {len(classification_map)} classification strings.")
+
+    # 2. Populate lang_data for predefined languages
+    print("Matching predefined languages...")
     for lang in languages_table:
-        gcode = lang.get('Glottocode')
+        # The 'ID' column in LanguageTable is the Glottocode (and links to ValueTable)
+        gcode = lang.get('ID')
         if gcode in predefined_set:
             lang_data[gcode] = {
                 'Latitude': lang.get('Latitude'),
                 'Longitude': lang.get('Longitude'),
-                'Lineage': lang.get('Lineage')  # Assumes 'Lineage' column exists
+                # Get lineage from our new map
+                'Lineage': classification_map.get(gcode)
             }
 
     # Check for missing languages
@@ -130,6 +142,18 @@ def main():
     if missing:
         print(f"Warning: Could not find data for {len(missing)} language(s):")
         for gcode in missing:
+            print(f"  - {gcode}")
+
+    # Add a new check for missing *lineage* data
+    missing_lineage = []
+    for gcode, data in lang_data.items():
+        if data['Lineage'] is None and gcode in predefined_set:
+            missing_lineage.append(gcode)
+
+    if missing_lineage:
+        print(
+            f"Warning: Could not find classification/lineage data for {len(missing_lineage)} language(s) (may be isolates):")
+        for gcode in missing_lineage:
             print(f"  - {gcode}")
 
     if not found_glottocodes:

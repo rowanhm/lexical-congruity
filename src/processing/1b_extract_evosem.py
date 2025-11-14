@@ -18,7 +18,7 @@ lang_lookup = {
     "armenian": "classical-middle_armenian",
     "indonesian": "standard_indonesian",
     "old_javanese": "kawi",
-    "azerbaijani": "central_oghuz",
+    "azerbaijani": "north_azerbaijani",
     "ancient_greek": "ionic-attic_ancient_greek",
     "malay": "standard_malay",
     "tongan": "tonga_(tonga_islands)",
