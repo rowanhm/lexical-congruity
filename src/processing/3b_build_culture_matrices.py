@@ -10,9 +10,8 @@ OUTPUT_DIR = 'bin/matrices'
 METRICS = ['pdi', 'idv', 'mas', 'uai', 'lto', 'ivr']
 HOFSTEDE_RANGE = 100.0
 
-# TODO Correct this and apply it to the matrix
 countries_dict = {
-    "Albania": "alba1267",
+    "Albania": "gheg1238",
     "Algeria": "alge1239",
     "Angola": "port1283",
     "Argentina": "stan1288",
@@ -59,9 +58,9 @@ countries_dict = {
     "India": "hind1269",
     "Indonesia": "indo1316",
     "Iran": "west2369",
-    "Iraq": "gili1239",
+    "Iraq": "jude1266",
     "Ireland": "iris1253",
-    "Israel": "mode1271",
+    "Israel": "hebr1245",
     "Italy": "ital1282",
     "Jamaica": "jama1262",
     "Japan": "nucl1643",
@@ -88,11 +87,11 @@ countries_dict = {
     "Netherlands": "dutc1256",
     "New zealand": "stan1293",
     "Nigeria": "nige1257",
-    "North macedonia": "mace1251",
+    "North macedonia": "mace1250",
     "Norway": "norw1258",
     "Pakistan": "urdu1245",
     "Panama": "stan1288",
-    "Paraguay": "guar1248",
+    "Paraguay": "stan1288",
     "Peru": "stan1288",
     "Philippines": "taga1270",
     "Poland": "poli1260",
@@ -101,32 +100,32 @@ countries_dict = {
     "Qatar": "gulf1241",
     "Romania": "roma1327",
     "Russia": "russ1263",
-    "São tomé and príncipe": "saot1240",
+    "São tomé and príncipe": "port1283",
     "Saudi arabia": "najd1235",
     "Senegal": "wolo1247",
     "Serbia": "serb1264",
     "Sierra leone": "krio1253",
     "Singapore": "stan1293",
-    "Slovakia": "slov1268",
-    "Slovenia": "slov1269",
+    "Slovakia": "slov1269",
+    "Slovenia": "slov1268",
     "South africa": "zulu1248",
     "South korea": "kore1280",
     "Spain": "stan1288",
-    "Sri lanka": "sinl1252",
+    "Sri lanka": "sinh1246",
     "Suriname": "dutc1256",
     "Sweden": "swed1254",
-    "Switzerland": "stan1295",
+    "Switzerland": "swis1247",
     "Syria": "nort3139",
     "Taiwan": "mand1415",
     "Tanzania": "swah1253",
     "Thailand": "thai1261",
-    "Trinidad and tobago": "trin1278",
-    "Tunisia": "tuni1253",
-    "Turkey": "turk1311",
+    "Trinidad and tobago": "trin1274",
+    "Tunisia": "tuni1259",
+    "Turkey": "nucl1301",
     "Ukraine": "ukra1253",
     "United arab emirates": "gulf1241",
     "United kingdom": "stan1293",
-    "United states": "stan1288",
+    "United states": "stan1293",
     "Uruguay": "stan1288",
     "Venezuela": "stan1288",
     "Vietnam": "viet1252",
@@ -152,10 +151,22 @@ def main():
         else:
             print(f"Warning: Metric column '{col}' not found in CSV. Skipping.")
 
-    countries = df.index.tolist()
+    # --- New Aggregation Step ---
+    # Map countries to lang_codes (or keep original name if not in dict)
+    grouping_keys = [countries_dict.get(country, country) for country in df.index]
+    df['lang_code'] = grouping_keys
+
+    # Group by lang_code, calculate the mean of metrics
+    # This creates a new DataFrame (df_agg) indexed by the unique lang_codes
+    df_agg = df.groupby('lang_code')[METRICS].mean()
+    # --- End Aggregation Step ---
+
+    # The rest of the script now uses the aggregated data
+    countries = df_agg.index.tolist()
 
     # 3. Create Normalized DataFrame (Scores from 0.0 to 1.0)
-    df_normalized = df[METRICS] / HOFSTEDE_RANGE
+    # Use the new aggregated DataFrame 'df_agg'
+    df_normalized = df_agg[METRICS] / HOFSTEDE_RANGE
 
     # 4. Generate Per-Metric Difference Matrices (Vectorized)
     print("Generating per-metric difference matrices...")
