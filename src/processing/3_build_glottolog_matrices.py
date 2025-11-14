@@ -1,9 +1,9 @@
 import json
 import math
-import pandas as pd
 from pathlib import Path
 from pycldf.dataset import Dataset
-
+from tqdm import tqdm
+import pandas as pd
 
 with open('bin/languages.json', 'r') as file:
     data = json.load(file)
@@ -139,20 +139,6 @@ def main():
     print(f"Found data for {len(found_glottocodes)} languages.")
 
     # --- 2. Initialize Matrices (as Pandas DataFrames) ---
-    try:
-        import pandas as pd
-    except ImportError:
-        print("Error: 'pandas' library not found. Please install it: `pip install pandas`")
-        return
-
-    try:
-        import tqdm
-    except ImportError:
-        print("Error: 'tqdm' library not found. Please install it: `pip install tqdm`")
-        # Fallback to a simple iterator if tqdm is not present
-        global tqdm
-        tqdm = lambda x, **kwargs: x
-
     df_distance = pd.DataFrame(
         index=found_glottocodes,
         columns=found_glottocodes,

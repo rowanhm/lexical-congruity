@@ -75,6 +75,10 @@ def main():
                 # Skip languages with no forms if we don't want empty files
                 continue
 
+            if glot_code == 'song1313' or glot_code == 'lait1239':
+                # Retired codes
+                continue
+
             # Convert sets to lists for JSON serialization
             serializable_data = {
                 form: list(concept_set) for form, concept_set in lang_data.items()
