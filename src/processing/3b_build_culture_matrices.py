@@ -10,7 +10,7 @@ OUTPUT_DIR = 'bin/matrices'
 METRICS = ['pdi', 'idv', 'mas', 'uai', 'lto', 'ivr']
 HOFSTEDE_RANGE = 100.0
 
-countries_dict = {
+COUNTRIES_TO_LANGS = {
     "Albania": "gheg1238",
     "Algeria": "alge1239",
     "Angola": "port1283",
@@ -132,9 +132,21 @@ countries_dict = {
     "Zambia": "stan1293"
 }
 
+COUNTRIES_TO_EXCLUDE = {
+    "Argentina", "Bolivia", "Chile", "Colombia", "Costa rica",
+    "Dominican republic", "Ecuador", "El salvador", "Guatemala", "Honduras",
+    "Mexico", "Panama", "Paraguay", "Peru", "Puerto rico", "Uruguay", "Venezuela",
+    "Angola", "Brazil", "Mozambique", "São tomé and príncipe", "Cape verde",
+    "Australia", "Canada", "Fiji", "Ghana", "Jamaica", "Kenya", "Malawi",
+    "Namibia", "New zealand", "Nigeria", "Sierra leone", "Singapore",
+    "South africa", "Tanzania", "Trinidad and tobago", "Zambia", "United states", "Belgium",
+    "Switzerland", "Suriname", "Burkina faso", "Senegal"
+}
+
+
 # --- Main Script ---
 def main():
-    # 1. Setup: Ensure output directory exists
+    # 1. Setup
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # 2. Load Data
@@ -144,75 +156,88 @@ def main():
         print(f"Error reading CSV file '{INPUT_FILE}': {e}")
         return
 
-    # Ensure all metric columns are numeric, coercing errors (blanks -> NaN)
+    # 3. --- (Req 1): Filter out colonial-context countries ---
+    original_count = len(df)
+    df = df[~df.index.isin(COUNTRIES_TO_EXCLUDE)]
+    dropped_count = original_count - len(df)
+    if dropped_count > 0:
+        print(f"Dropped {dropped_count} specified colonial-context countries.")
+
+    # 4. Process Data
     for col in METRICS:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
         else:
             print(f"Warning: Metric column '{col}' not found in CSV. Skipping.")
 
-    # --- New Aggregation Step ---
-    # Map countries to lang_codes (or keep original name if not in dict)
-    grouping_keys = [countries_dict.get(country, country) for country in df.index]
+    # 5. --- (Req 2): Aggregation Step ---
+    grouping_keys = [COUNTRIES_TO_LANGS[country] for country in df.index]
     df['lang_code'] = grouping_keys
 
-    # Group by lang_code, calculate the mean of metrics
-    # This creates a new DataFrame (df_agg) indexed by the unique lang_codes
+    # Calculate mean per metric (respects Req 2)
     df_agg = df.groupby('lang_code')[METRICS].mean()
-    # --- End Aggregation Step ---
 
-    # The rest of the script now uses the aggregated data
-    countries = df_agg.index.tolist()
+    # 6. Normalize
+    # This DataFrame will contain NaNs for languages with missing metrics
+    df_normalized = df_agg / HOFSTEDE_RANGE
+    print(f"Aggregated data into {len(df_normalized)} language groups.")
 
-    # 3. Create Normalized DataFrame (Scores from 0.0 to 1.0)
-    # Use the new aggregated DataFrame 'df_agg'
-    df_normalized = df_agg[METRICS] / HOFSTEDE_RANGE
-
-    # 4. Generate Per-Metric Difference Matrices (Vectorized)
+    # 7. --- (Req 3 Corrected): Generate Per-Metric Difference Matrices ---
     print("Generating per-metric difference matrices...")
     for metric in METRICS:
         if metric not in df_normalized.columns:
             continue
 
-        # Extract column as a (N, 1) numpy array
-        col_data = df_normalized[[metric]].values
+        # Select the column for this metric AND drop NaNs *for this metric only*
+        metric_data_series = df_normalized[metric].dropna()
 
-        # Use numpy broadcasting (N, 1) - (1, N) to get an (N, N) matrix
-        # np.abs(NaN - 0.5) correctly results in NaN.
+        # Get the list of languages that have data *for this metric*
+        metric_countries = metric_data_series.index.tolist()
+
+        if not metric_countries:
+            print(f"  Skipping '{metric}' matrix: No language groups have data.")
+            continue
+
+        # Get data as a (N, 1) numpy array
+        col_data = metric_data_series.to_frame().values
+
+        # Calculate difference matrix
         diff_matrix_np = np.abs(col_data - col_data.T)
+        diff_matrix = pd.DataFrame(diff_matrix_np, index=metric_countries, columns=metric_countries)
 
-        # Convert back to DataFrame
-        diff_matrix = pd.DataFrame(diff_matrix_np, index=countries, columns=countries)
-
-        # Save the matrix to CSV
+        # Save
         output_path = os.path.join(OUTPUT_DIR, f'hofstede_{metric}_difference.csv')
         diff_matrix.to_csv(output_path)
+        print(f"  Saved '{metric}' matrix with {len(metric_countries)} languages.")
 
     print("Per-metric matrices saved.")
 
-    # 5. Generate Overall Euclidean Distance Matrix (Vectorized)
+    # 8. --- (Req 3 Corrected): Generate Overall Euclidean Distance Matrix ---
     print("Generating overall Euclidean distance matrix...")
 
-    # Get the (N, 6) numpy array of normalized data
-    data_norm = df_normalized.values
+    # *Now*, create a new DataFrame by dropping rows with *any* missing metrics
+    df_euclidean = df_normalized.dropna(subset=METRICS, how='any')
 
-    # Use broadcasting to create an (N, N, 6) array of differences
-    # (N, 1, 6) - (1, N, 6) = (N, N, 6)
-    diffs = data_norm[:, np.newaxis, :] - data_norm[np.newaxis, :, :]
+    euclidean_countries = df_euclidean.index.tolist()
 
-    # Square, sum, and sqrt. np.sum propagates NaNs, which is the correct logic
-    # (if any metric is missing, the total distance is NaN)
-    sum_sq_diffs = np.sum(diffs ** 2, axis=2)
-    euc_dist_np = np.sqrt(sum_sq_diffs)
+    if not euclidean_countries:
+        print("  Skipping Euclidean matrix: No language groups have complete (6/6) data.")
+    else:
+        # Get the (N, 6) numpy array (guaranteed to be free of NaNs)
+        data_norm = df_euclidean.values
 
-    # Convert to DataFrame
-    euclidean_matrix = pd.DataFrame(euc_dist_np, index=countries, columns=countries)
+        # Calculate Euclidean distance
+        diffs = data_norm[:, np.newaxis, :] - data_norm[np.newaxis, :, :]
+        sum_sq_diffs = np.sum(diffs ** 2, axis=2)
+        euc_dist_np = np.sqrt(sum_sq_diffs)
 
-    # Save the final matrix
-    output_path = os.path.join(OUTPUT_DIR, 'hofstede_euclidean_difference.csv')
-    euclidean_matrix.to_csv(output_path)
+        euclidean_matrix = pd.DataFrame(euc_dist_np, index=euclidean_countries, columns=euclidean_countries)
 
-    print(f"Euclidean distance matrix saved to {output_path}")
+        # Save
+        output_path = os.path.join(OUTPUT_DIR, 'hofstede_euclidean_difference.csv')
+        euclidean_matrix.to_csv(output_path)
+        print(f"  Euclidean distance matrix saved with {len(euclidean_countries)} languages.")
+
     print("All tasks complete.")
 
 

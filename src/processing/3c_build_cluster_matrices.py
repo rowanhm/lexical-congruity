@@ -245,12 +245,9 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     resource_paths = glob.glob(os.path.join(LEXICA_DIR, "*"))
+    resource_paths = [resource_paths[0]]
     for resource_path in resource_paths:
         if not os.path.isdir(resource_path):
-            continue
-
-        # TODO remove
-        if 'lexibank' in resource_path:
             continue
 
         resource_name = os.path.basename(resource_path)
@@ -327,7 +324,8 @@ def main():
                 sys.stdout.flush()
 
                 # Limit cores to leave 2 free, but always use at least 1
-                max_cores_to_use = max(1, os.cpu_count() - 2)
+                max_cores_to_use = max(1, os.cpu_count() - 4)
+                print(f"  Running with {max_cores_to_use} cores.")
                 with concurrent.futures.ProcessPoolExecutor(max_workers=max_cores_to_use) as executor:
 
                     # Submit all tasks
