@@ -5,6 +5,7 @@ import glob
 import itertools
 import csv
 import concurrent.futures
+import sys  # For flushing output
 
 import numpy as np
 from scipy.sparse import csc_matrix
@@ -17,7 +18,7 @@ METRICS = ["omega", "nmi", "f1", "jaccard"]
 
 
 # --- Optimized Metric Computation (Vectorized) ---
-# (These functions, _xlogx, _entropy, _compute_nmi, are unchanged)
+# (Helpers _xlogx, _entropy, _compute_nmi, _build_membership_matrix are unchanged)
 def _xlogx(v):
     if v == 0: return 0.0
     return v * np.log2(v)
@@ -53,10 +54,6 @@ def _compute_nmi(cm, sizes1, sizes2, n_items):
 
 
 def _build_membership_matrix(sets_list, item_map):
-    """
-    Builds a sparse binary membership matrix (CSC format).
-    Rows = items, Cols = clusters
-    """
     n_items = len(item_map)
     n_clusters = len(sets_list)
     if n_clusters == 0:
@@ -64,7 +61,7 @@ def _build_membership_matrix(sets_list, item_map):
     data, row_indices, col_indices = [], [], []
     for j, cluster in enumerate(sets_list):
         for item in cluster:
-            i = item_map.get(item)  # Get index from GLOBAL map
+            i = item_map.get(item)
             if i is not None:
                 data.append(1)
                 row_indices.append(i)
@@ -73,25 +70,41 @@ def _build_membership_matrix(sets_list, item_map):
                       shape=(n_items, n_clusters), dtype=np.int8)
 
 
-# --- NEW: Refactored function to accept pre-built matrices ---
+# --- REVISED: Now uses fast sparse intersection ---
 def compute_all_metrics_from_matrices(M1, M2, n_items):
     """
-    Computes all metrics from two PRE-COMPUTED sparse matrices.
+    Computes all metrics from two PRE-COMPUTED sparse matrices
+    using optimized sparse-only operations.
     """
     results = {}
 
     # === 1. Compute Pair-Based Metrics (Omega, F1, Jaccard) ===
-    C1_co = M1.dot(M1.T).tocoo()
-    c1_pairs = set((i, j) for i, j in zip(C1_co.row, C1_co.col) if i < j)
 
-    C2_co = M2.dot(M2.T).tocoo()
-    c2_pairs = set((i, j) for i, j in zip(C2_co.row, C2_co.col) if i < j)
+    # C1_co = (items x items) sparse co-occurrence matrix for M1
+    C1_co = M1.dot(M1.T)
+    # C2_co = (items x items) sparse co-occurrence matrix for M2
+    C2_co = M2.dot(M2.T)
 
-    a = len(c1_pairs.intersection(c2_pairs))
-    a_plus_b = len(c1_pairs)
-    a_plus_c = len(c2_pairs)
+    # 'a' = pairs in both (intersection)
+    # C_common = element-wise product
+    C_common = C1_co.multiply(C2_co)
+
+    # .sum() sums all elements.
+    # We must subtract the diagonal, then divide by 2 to get upper triangle.
+    diag_sum_common = C_common.diagonal().sum()
+    a = (C_common.sum() - diag_sum_common) / 2.0
+
+    # 'a+b' = pairs in C1
+    diag_sum_c1 = C1_co.diagonal().sum()
+    a_plus_b = (C1_co.sum() - diag_sum_c1) / 2.0
+
+    # 'a+c' = pairs in C2
+    diag_sum_c2 = C2_co.diagonal().sum()
+    a_plus_c = (C2_co.sum() - diag_sum_c2) / 2.0
+
     b = a_plus_b - a
     c = a_plus_c - a
+
     union = a + b + c
 
     denominator_f1 = (2 * a) + b + c
@@ -110,17 +123,12 @@ def compute_all_metrics_from_matrices(M1, M2, n_items):
     return results
 
 
-# --- Helper Functions for Parallelism ---
-
+# --- Helper Functions for Parallelism (Unchanged) ---
 def _load_language_file(lang_file):
-    """
-    Worker function to load a single JSON file (for parallel I/O).
-    """
     lang_code = os.path.basename(lang_file).split(".")[0]
     try:
         with open(lang_file, "r", encoding="utf-8") as f:
             data = json.load(f)
-            # Convert to sets immediately
             sets_list = [set(v) for v in data.values()]
             return lang_code, sets_list
     except Exception as e:
@@ -129,20 +137,12 @@ def _load_language_file(lang_file):
 
 
 def _compute_pair(task_data):
-    """
-    Worker function to compute all metrics for a single pair of languages.
-    NOW receives pre-computed matrices.
-    """
     lang1, lang2, M1, M2, n_items = task_data
-
     try:
-        # This one call does all the math!
         results = compute_all_metrics_from_matrices(M1, M2, n_items)
-
     except Exception as e:
         print(f"Error computing metrics for {lang1}-{lang2}: {e}")
-        results = {metric: math.nan for metric in METRICS}
-
+        results = {metric: math.nan for metric in METRICS}  # Use NaN for errors
     return (lang1, lang2, results)
 
 
@@ -161,12 +161,11 @@ def main():
         resource_name = os.path.basename(resource_path)
         print(f"Processing resource: {resource_name}...")
 
-        # --- 2. Load all language data (Now in parallel) ---
-        language_data = {}  # Still {lang: list[set]}
+        # --- 2. Load all language data (Parallel I/O) ---
+        language_data = {}
         lang_files = glob.glob(os.path.join(resource_path, "*.json"))
 
         print(f"  Loading {len(lang_files)} language files...")
-        # Use ThreadPoolExecutor for I/O-bound tasks
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = [executor.submit(_load_language_file, f) for f in lang_files]
             for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="  Loading data"):
@@ -178,12 +177,11 @@ def main():
             print(f"  Not enough language data to compare for {resource_name}. Skipping.")
             continue
 
-        # --- NEW: 3. Pre-computation Step ---
+        # --- 3. Pre-computation Step (Unchanged) ---
         print("  Building global item universe...")
         global_universe = set()
         for sets_list in language_data.values():
-            for s in sets_list:
-                global_universe.update(s)
+            for s in sets_list: global_universe.update(s)
 
         n_items = len(global_universe)
         if n_items == 0:
@@ -193,58 +191,94 @@ def main():
         global_item_map = {item: i for i, item in enumerate(global_universe)}
 
         print("  Pre-computing all language matrices...")
-        language_matrices = {}  # Will hold {lang: csc_matrix}
+        language_matrices = {}
         for lang_code, sets_list in tqdm(language_data.items(), desc="  Building matrices"):
             language_matrices[lang_code] = _build_membership_matrix(sets_list, global_item_map)
 
-        # Clear large intermediate data
-        del language_data
-        del global_item_map
+        del language_data, global_item_map  # Free memory
 
-        # --- 4. Prepare result matrices (as before) ---
+        # --- 4. Prepare result matrices ---
         languages = sorted(language_matrices.keys())
         all_results = {}
         for metric_name in METRICS:
+            # --- MODIFIED: Initialize with None for "uncomputed" ---
             all_results[metric_name] = {
-                lang: {inner_lang: 0.0 for inner_lang in languages}
+                lang: {inner_lang: None for inner_lang in languages}
                 for lang in languages
             }
 
-        # --- 5. Compute metrics (PARALLELIZED) ---
-        num_pairs = math.comb(len(languages), 2)
-        print(f"  Preparing {num_pairs} comparison tasks...")
-        tasks = []
-        for lang1, lang2 in itertools.combinations(languages, 2):
-            # Pass the PRE-COMPUTED matrices to the worker
-            tasks.append((lang1, lang2,
-                          language_matrices[lang1],
-                          language_matrices[lang2],
-                          n_items))
+        # --- NEW: 5. Load Existing Results (Checkpointing) ---
+        print("  Loading existing results for checkpointing...")
+        num_existing = 0
+        for metric_name in METRICS:
+            output_filename = os.path.join(OUTPUT_DIR, f"{resource_name}_{metric_name}.csv")
+            if os.path.exists(output_filename):
+                try:
+                    with open(output_filename, "r", newline="", encoding="utf-8") as f:
+                        reader = csv.reader(f)
+                        header = next(reader)[1:]  # Get lang codes from header
+                        lang_map = {lang: idx for idx, lang in enumerate(header)}
 
-        if not tasks:
-            print("  No language pairs to compute.")
-            continue
+                        for row in reader:
+                            lang_row = row[0]
+                            if lang_row not in languages: continue
 
-        # Use ProcessPoolExecutor for CPU-bound tasks (as before)
-        with concurrent.futures.ProcessPoolExecutor() as executor:
-            future_to_task = {executor.submit(_compute_pair, task): task for task in tasks}
-            for future in tqdm(concurrent.futures.as_completed(future_to_task),
-                               total=len(tasks),
-                               desc="  Processing metrics"):
+                            for lang_col, idx in lang_map.items():
+                                if lang_col not in languages: continue
 
-                lang1, lang2, pair_results = future.result()
+                                value_str = row[idx + 1]
+                                if value_str:  # Not empty string
+                                    try:
+                                        all_results[metric_name][lang_row][lang_col] = float(value_str)
+                                        if lang_row != lang_col:
+                                            num_existing += 1
+                                    except ValueError:
+                                        pass  # Keep as None if parse fails
+                except Exception as e:
+                    print(f"  Warning: Could not load {output_filename}. Recomputing. Error: {e}")
 
-                for metric_name, value in pair_results.items():
-                    if metric_name in all_results:
-                        all_results[metric_name][lang1][lang2] = value
-                        all_results[metric_name][lang2][lang1] = value
-
-        # --- 6. Set diagonal (as before) ---
+        # --- 6. Set diagonal ---
         for metric_name in METRICS:
             for lang in languages:
                 all_results[metric_name][lang][lang] = 1.0
 
-        # --- 7. Save matrices (as before) ---
+        # --- 7. Compute metrics (PARALLELIZED) ---
+        total_pairs = math.comb(len(languages), 2)
+        tasks = []
+
+        # --- MODIFIED: Only add tasks that are uncomputed ---
+        for lang1, lang2 in itertools.combinations(languages, 2):
+            if all_results["omega"][lang1][lang2] is None:  # Check one metric
+                tasks.append((lang1, lang2,
+                              language_matrices[lang1],
+                              language_matrices[lang2],
+                              n_items))
+
+        num_found = total_pairs - len(tasks)
+        print(f"  Found {num_found} / {total_pairs} existing results.")
+
+        if not tasks:
+            print("  All comparisons are already computed. Skipping.")
+        else:
+            print(f"  Preparing {len(tasks)} new comparison tasks...")
+            sys.stdout.flush()  # Force print before tqdm
+            # Use ProcessPoolExecutor for CPU-bound tasks
+            max_cores_to_use = max(1, os.cpu_count() - 2)
+            with concurrent.futures.ProcessPoolExecutor(max_workers=max_cores_to_use) as executor:
+                future_to_task = {executor.submit(_compute_pair, task): task for task in tasks}
+
+                for future in tqdm(concurrent.futures.as_completed(future_to_task),
+                                   total=len(tasks),
+                                   desc="  Processing metrics"):
+
+                    lang1, lang2, pair_results = future.result()
+
+                    for metric_name, value in pair_results.items():
+                        if metric_name in all_results:
+                            all_results[metric_name][lang1][lang2] = value
+                            all_results[metric_name][lang2][lang1] = value
+
+        # --- 8. Save matrices (as before) ---
         print("  Saving matrices...")
         for metric_name, results_matrix in all_results.items():
             output_filename = os.path.join(OUTPUT_DIR, f"{resource_name}_{metric_name}.csv")
@@ -252,8 +286,12 @@ def main():
                 writer = csv.writer(f)
                 writer.writerow([""] + languages)
                 for lang_row in languages:
-                    row_data = [results_matrix[lang_row][lang_col] for lang_col in languages]
-                    writer.writerow([lang_row] + row_data)
+                    row_data = [
+                        results_matrix[lang_row][lang_col]
+                        for lang_col in languages
+                    ]
+                    # Write row, saving None as an empty string
+                    writer.writerow([lang_row] + ["" if v is None else v for v in row_data])
 
     print("Processing complete.")
 
