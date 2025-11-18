@@ -206,7 +206,7 @@ def main():
         diff_matrix = pd.DataFrame(diff_matrix_np, index=metric_countries, columns=metric_countries)
 
         # Save
-        output_path = os.path.join(OUTPUT_DIR, f'hofstede_{metric}_difference.csv')
+        output_path = os.path.join(OUTPUT_DIR, f'hofstede_{metric}.csv')
         diff_matrix.to_csv(output_path)
         print(f"  Saved '{metric}' matrix with {len(metric_countries)} languages.")
 
@@ -234,7 +234,7 @@ def main():
         euclidean_matrix = pd.DataFrame(euc_dist_np, index=euclidean_countries, columns=euclidean_countries)
 
         # Save
-        output_path = os.path.join(OUTPUT_DIR, 'hofstede_euclidean_difference.csv')
+        output_path = os.path.join(OUTPUT_DIR, 'hofstede_avg.csv')
         euclidean_matrix.to_csv(output_path)
         print(f"  Euclidean distance matrix saved with {len(euclidean_countries)} languages.")
 

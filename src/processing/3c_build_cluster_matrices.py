@@ -5,54 +5,238 @@ import glob
 import itertools
 import csv
 import concurrent.futures
-import sqlite3  # For the database
-import multiprocessing  # For the Manager Queue
-import sys  # For flushing output
-
+import sqlite3
+import multiprocessing
 import numpy as np
-from scipy.sparse import csc_matrix
+from scipy.sparse import csc_matrix, csr_matrix
 from tqdm import tqdm
 
 # --- Configuration ---
 LEXICA_DIR = "bin/lexica"
 OUTPUT_DIR = "bin/matrices"
-METRICS = ["omega", "nmi", "f1", "jaccard"]
+METRICS = [
+    "omega",  # Omega Index
+    "nmi",  # Overlapping NMI
+    "f1",  # F1 Score
+    "jaccard",  # Jaccard Similarity
+    "overlap",  # Simpson's Overlap (Symmetric Robust)
+    "prec_max",  # Highest Precision (Robustness)
+    "rec_min",  # Lowest Recall (Missing Data Penalty)
+    "homo_max",  # Highest Homogeneity (Robustness)
+    "comp_min"  # Lowest Completeness (Missing Data Penalty)
+]
+
+# --- Global Storage for Workers ---
+_worker_matrices = None
+_worker_stats = None
 
 
-# --- Optimized Metric Computation (Vectorized) ---
-# (Helpers _xlogx, _entropy, _compute_nmi, _build_membership_matrix are unchanged)
-def _xlogx(v):
-    if v == 0: return 0.0
-    return v * np.log2(v)
+def _init_worker(matrices, stats):
+    """
+    Initializes worker processes with shared read-only data.
+    """
+    global _worker_matrices, _worker_stats
+    _worker_matrices = matrices
+    _worker_stats = stats
 
 
-def _entropy(p):
-    return -_xlogx(p) - _xlogx(1 - p)
+def _binary_entropy_vectorized(p):
+    """
+    Computes H(p) = -p*log2(p) - (1-p)*log2(1-p) for a vector p.
+    Handles 0 and 1 safely to avoid log(0).
+    """
+    # Initialize result with zeros (covers p=0 and p=1 cases implicitly)
+    res = np.zeros_like(p)
+
+    # Mask for p in (0, 1)
+    mask = (p > 0) & (p < 1)
+
+    if np.any(mask):
+        pm = p[mask]
+        res[mask] = -pm * np.log2(pm) - (1 - pm) * np.log2(1 - pm)
+
+    return res
 
 
-def _compute_nmi(cm, sizes1, sizes2, n_items):
-    if n_items == 0 or len(sizes1) == 0 or len(sizes2) == 0:
-        return 0.0
+def _compute_asymmetric_entropy_sparse(cm_sparse, sizes1, sizes2, n_items, h1_marginal, h2_marginal):
+    """
+    Computes conditional entropies and NMI using sparse matrix operations.
+    Avoids densifying the matrix to prevent OOM errors.
+    """
+    if n_items == 0:
+        return 0.0, 0.0, 0.0
+
+    if h1_marginal == 0 and h2_marginal == 0:
+        return 1.0, 1.0, 1.0
+    if h1_marginal == 0:
+        return 0.0, 1.0, 0.0
+    if h2_marginal == 0:
+        return 1.0, 0.0, 0.0
+
+    # Extract sparse data for vectorization
+    # cm_sparse is M1.T @ M2 (Rows: Lang1 Clusters, Cols: Lang2 Clusters)
+    data = cm_sparse.data
+    rows, cols = cm_sparse.nonzero()
+
     p1 = sizes1 / n_items
     p2 = sizes2 / n_items
-    h_x_vec = np.vectorize(_entropy)(p1)
-    h_y_vec = np.vectorize(_entropy)(p2)
-    H_X = h_x_vec.sum()
-    H_Y = h_y_vec.sum()
-    if H_X == 0 or H_Y == 0:
-        return 0.0
-    sizes1_col = sizes1.reshape(-1, 1)
-    sizes2_row = sizes2.reshape(1, -1)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        p_x_given_y = np.nan_to_num(cm / sizes2_row)
-        h_x_given_y_matrix = np.vectorize(_entropy)(p_x_given_y)
-        p_y_given_x = np.nan_to_num(cm / sizes1_col)
-        h_y_given_x_matrix = np.vectorize(_entropy)(p_y_given_x)
-    H_X_given_Y = np.sum((p2 * np.sum(h_x_given_y_matrix, axis=0)))
-    H_Y_given_X = np.sum((p1 * np.sum(h_y_given_x_matrix, axis=1)))
-    I_XY = (H_X - H_X_given_Y + H_Y - H_Y_given_X) / 2.0
-    nmi = I_XY / max(np.sqrt(H_X * H_Y), 1e-15)
-    return nmi
+
+    # --- H(X|Y): Uncertainty of Lang1 given Lang2 ---
+    # P(x|y) = count(x,y) / size(y)
+    denoms_y = sizes2[cols]
+    p_x_given_y = data / denoms_y
+
+    # Calculate binary entropy for each intersection
+    h_vals_xy = _binary_entropy_vectorized(p_x_given_y)
+
+    # Aggregate entropies per column (Lang2 cluster)
+    # Sum_x H(X=x|Y=y)
+    h_xy_sums = np.zeros(len(sizes2))
+    np.add.at(h_xy_sums, cols, h_vals_xy)
+
+    # Weighted average by P(Y)
+    H_X_given_Y = np.sum(p2 * h_xy_sums)
+
+    # --- H(Y|X): Uncertainty of Lang2 given Lang1 ---
+    # P(y|x) = count(x,y) / size(x)
+    denoms_x = sizes1[rows]
+    p_y_given_x = data / denoms_x
+
+    # Calculate binary entropy for each intersection
+    h_vals_yx = _binary_entropy_vectorized(p_y_given_x)
+
+    # Aggregate entropies per row (Lang1 cluster)
+    h_yx_sums = np.zeros(len(sizes1))
+    np.add.at(h_yx_sums, rows, h_vals_yx)
+
+    # Weighted average by P(X)
+    H_Y_given_X = np.sum(p1 * h_yx_sums)
+
+    # Results
+    # If H(X|Y) is 0, knowing Y tells us X perfectly.
+    homog_1_given_2 = 1.0 - (H_X_given_Y / h1_marginal)
+    homog_2_given_1 = 1.0 - (H_Y_given_X / h2_marginal)
+
+    # NMI (Symmetric)
+    I_XY = (h1_marginal - H_X_given_Y + h2_marginal - H_Y_given_X) / 2.0
+    nmi = I_XY / max(np.sqrt(h1_marginal * h2_marginal), 1e-15)
+
+    return homog_1_given_2, homog_2_given_1, nmi
+
+
+def precompute_language_stats(matrix, n_items):
+    """
+    Calculates invariant statistics for a language matrix.
+    Run once per language to save compute time during pairwise comparisons.
+    """
+    # 1. Cluster Sizes and Marginal Entropy
+    sizes = np.array(matrix.sum(axis=0)).flatten()
+    p_vec = sizes / n_items
+    marginal_entropy = np.sum(_binary_entropy_vectorized(p_vec))
+
+    # 2. Self-Pairs (for Omega/F1)
+    # Faster to compute using CSR dot product
+    matrix_csr = matrix.tocsr()
+    c_co = matrix_csr.dot(matrix_csr.T)
+    diag_sum = c_co.diagonal().sum()
+    pairs_count = (c_co.sum() - diag_sum) / 2.0
+
+    return {
+        "sizes": sizes,
+        "marginal_entropy": marginal_entropy,
+        "pairs_count": pairs_count
+    }
+
+
+def _compute_pair(task_data):
+    """
+    Worker function to compute metrics between two languages.
+    """
+    lang1, lang2, n_items, queue = task_data
+
+    # Retrieve shared data
+    M1 = _worker_matrices[lang1]
+    M2 = _worker_matrices[lang2]
+    stats1 = _worker_stats[lang1]
+    stats2 = _worker_stats[lang2]
+
+    results = {}
+
+    try:
+        # --- Pairwise Counts (Intersection) ---
+        # M is (Items x Clusters). Dot product gives (Items x Items) co-occurrence.
+        # We only compute the intersection of the two co-occurrence matrices.
+
+        # Note: M1.dot(M1.T) is heavy. We rely on sparse multiplication efficiency.
+        # In a highly optimized setting, we would avoid the full M*M.T if items > 50k,
+        # but strictly following the logic required for Omega/F1 on clusters, we proceed.
+        C1_co = M1.dot(M1.T)
+        C2_co = M2.dot(M2.T)
+
+        # Element-wise multiply to find common pairs
+        C_common = C1_co.multiply(C2_co)
+
+        diag_sum_common = C_common.diagonal().sum()
+        a = (C_common.sum() - diag_sum_common) / 2.0  # Intersection
+
+        pairs_in_1 = stats1["pairs_count"]
+        pairs_in_2 = stats2["pairs_count"]
+
+        b = pairs_in_1 - a
+        c = pairs_in_2 - a
+
+        # --- Basic Metrics ---
+        union = a + b + c
+        denom_f1 = (2 * a) + b + c
+
+        results["f1"] = (2 * a) / denom_f1 if denom_f1 > 0 else 1.0
+        results["jaccard"] = a / union if union > 0 else 1.0
+
+        # --- Omega Index ---
+        n_pairs_total = (n_items * (n_items - 1)) / 2.0
+        if n_pairs_total > 0:
+            expected_a = (pairs_in_1 * pairs_in_2) / n_pairs_total
+            max_a = (pairs_in_1 + pairs_in_2) / 2.0
+            denominator = max_a - expected_a
+            if denominator != 0:
+                results["omega"] = (a - expected_a) / denominator
+            else:
+                results["omega"] = 1.0
+        else:
+            results["omega"] = 0.0
+
+        # --- Simpson / Precision / Recall ---
+        min_size = min(pairs_in_1, pairs_in_2)
+        results["overlap"] = a / min_size if min_size > 0 else 1.0
+
+        val1 = a / pairs_in_1 if pairs_in_1 > 0 else 0.0
+        val2 = a / pairs_in_2 if pairs_in_2 > 0 else 0.0
+
+        results["prec_max"] = max(val1, val2)
+        results["rec_min"] = min(val1, val2)
+
+        # --- Entropy Metrics (Sparse) ---
+        # Contingency Matrix: Rows=Clusters1, Cols=Clusters2
+        cm_sparse = M1.T.dot(M2)
+
+        h1_given_2, h2_given_1, nmi = _compute_asymmetric_entropy_sparse(
+            cm_sparse,
+            stats1["sizes"],
+            stats2["sizes"],
+            n_items,
+            stats1["marginal_entropy"],
+            stats2["marginal_entropy"]
+        )
+
+        results["nmi"] = nmi
+        results["homo_max"] = max(h1_given_2, h2_given_1)
+        results["comp_min"] = min(h1_given_2, h2_given_1)
+
+    except Exception as e:
+        print(f"Error computing {lang1}-{lang2}: {e}")
+        results = {metric: math.nan for metric in METRICS}
+
+    queue.put((lang1, lang2, results))
 
 
 def _build_membership_matrix(sets_list, item_map):
@@ -60,6 +244,7 @@ def _build_membership_matrix(sets_list, item_map):
     n_clusters = len(sets_list)
     if n_clusters == 0:
         return csc_matrix((n_items, 0), dtype=np.int8)
+
     data, row_indices, col_indices = [], [], []
     for j, cluster in enumerate(sets_list):
         for item in cluster:
@@ -68,41 +253,13 @@ def _build_membership_matrix(sets_list, item_map):
                 data.append(1)
                 row_indices.append(i)
                 col_indices.append(j)
+
+    # Create CSC first for efficient construction
     return csc_matrix((data, (row_indices, col_indices)),
                       shape=(n_items, n_clusters), dtype=np.int8)
 
 
-def compute_all_metrics_from_matrices(M1, M2, n_items):
-    # This function is unchanged and uses the fast sparse intersection
-    results = {}
-    C1_co = M1.dot(M1.T)
-    C2_co = M2.dot(M2.T)
-    C_common = C1_co.multiply(C2_co)
-    diag_sum_common = C_common.diagonal().sum()
-    a = (C_common.sum() - diag_sum_common) / 2.0
-    diag_sum_c1 = C1_co.diagonal().sum()
-    a_plus_b = (C1_co.sum() - diag_sum_c1) / 2.0
-    diag_sum_c2 = C2_co.diagonal().sum()
-    a_plus_c = (C2_co.sum() - diag_sum_c2) / 2.0
-    b = a_plus_b - a
-    c = a_plus_c - a
-    union = a + b + c
-    denominator_f1 = (2 * a) + b + c
-    results["f1"] = (2 * a) / denominator_f1 if denominator_f1 > 0 else 1.0
-    jaccard = a / union if union > 0 else 1.0
-    results["jaccard"] = jaccard
-    results["omega"] = jaccard
-    cm = M1.T.dot(M2).toarray()
-    sizes1 = M1.sum(axis=0).A1
-    sizes2 = M2.sum(axis=0).A1
-    results["nmi"] = _compute_nmi(cm, sizes1, sizes2, n_items)
-    return results
-
-
-# --- Helper Functions for Parallelism ---
-
 def _load_language_file(lang_file):
-    # This is the (fixed) file loader, unchanged
     lang_code = os.path.basename(lang_file).split(".")[0]
     try:
         with open(lang_file, "r", encoding="utf-8") as f:
@@ -114,36 +271,11 @@ def _load_language_file(lang_file):
         return lang_code, None
 
 
-def _compute_pair(task_data):
-    """
-    Worker function: Computes metrics and PUTS the result into the shared queue.
-    """
-    # CHANGE: Unpack only keys and metadata (M1/M2 are removed from arguments)
-    lang1, lang2, n_items, queue = task_data
-
-    # CHANGE: Retrieve heavy matrices from global worker storage
-    M1 = _worker_matrices[lang1]
-    M2 = _worker_matrices[lang2]
-
-    try:
-        results = compute_all_metrics_from_matrices(M1, M2, n_items)
-    except Exception as e:
-        print(f"Error computing metrics for {lang1}-{lang2}: {e}")
-        results = {metric: math.nan for metric in METRICS}
-
-    queue.put((lang1, lang2, results))
-    return True
-
-
-# --- NEW: Database Helper Functions ---
+# --- Database Helpers ---
 
 def init_db(conn, languages):
-    """
-    Initializes the SQLite database, creating tables if they don't exist.
-    """
-    with conn:  # Creates a transaction
+    with conn:
         cursor = conn.cursor()
-        # Create table to hold all results
         metric_cols = ", ".join([f"{name} REAL" for name in METRICS])
         cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS results (
@@ -153,13 +285,11 @@ def init_db(conn, languages):
                 PRIMARY KEY (lang1, lang2)
             )
         """)
-        # Create table to hold the master list of languages
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS languages (
                 lang TEXT PRIMARY KEY
             )
         """)
-        # Add all languages to the languages table
         cursor.executemany(
             "INSERT OR IGNORE INTO languages (lang) VALUES (?)",
             [(lang,) for lang in languages]
@@ -167,65 +297,62 @@ def init_db(conn, languages):
 
 
 def load_done_pairs(conn):
-    """
-    Reads the DB and returns a set of all (lang1, lang2) pairs already computed.
-    """
     done_pairs = set()
     with conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT lang1, lang2 FROM results")
-        for row in cursor.fetchall():
-            # Sort to handle (A, B) vs (B, A)
-            done_pairs.add(tuple(sorted(row)))
+        try:
+            cursor.execute("SELECT lang1, lang2 FROM results")
+            for row in cursor.fetchall():
+                done_pairs.add(tuple(sorted(row)))
+        except sqlite3.OperationalError:
+            pass  # Table might not exist yet
     return done_pairs
 
 
-def save_result_to_db(conn, lang1, lang2, results):
-    """
-    Saves a single computed result to the database.
-    This is crash-safe.
-    """
-    with conn:  # Creates a transaction
+def save_batch_results(conn, batch):
+    if not batch:
+        return
+    with conn:
         metric_names = ", ".join(METRICS)
         placeholders = ", ".join(["?"] * len(METRICS))
-        values = [results[name] for name in METRICS]
 
-        conn.execute(
+        db_rows = []
+        for lang1, lang2, results in batch:
+            values = [results.get(name, math.nan) for name in METRICS]
+            db_rows.append((lang1, lang2, *values))
+
+        conn.executemany(
             f"INSERT OR REPLACE INTO results (lang1, lang2, {metric_names}) VALUES (?, ?, {placeholders})",
-            (lang1, lang2, *values)
+            db_rows
         )
 
 
 def export_to_csv(conn, resource_name, output_dir):
-    """
-    Reads the complete database and writes all final CSV matrices.
-    """
-    languages = []
     with conn:
         cursor = conn.cursor()
         cursor.execute("SELECT lang FROM languages ORDER BY lang")
         languages = [row[0] for row in cursor.fetchall()]
 
     if not languages:
-        print("  No languages found in DB, skipping CSV export.")
         return
 
-    # 1. Initialize empty results dictionaries
     all_results = {}
     for metric_name in METRICS:
         all_results[metric_name] = {
             lang: {inner_lang: None for inner_lang in languages}
             for lang in languages
         }
-        # Set diagonal
         for lang in languages:
             all_results[metric_name][lang][lang] = 1.0
 
-    # 2. Load all results from DB
     with conn:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM results")
-        for row in cursor.fetchall():
+        rows = cursor.fetchall()
+
+        # Map column indices
+        # Schema: lang1, lang2, metric1, metric2...
+        for row in rows:
             lang1, lang2 = row[0], row[1]
             for i, metric_name in enumerate(METRICS):
                 value = row[i + 2]
@@ -233,9 +360,8 @@ def export_to_csv(conn, resource_name, output_dir):
                     all_results[metric_name][lang1][lang2] = value
                     all_results[metric_name][lang2][lang1] = value
 
-    # 3. Write all CSV files (same logic as before)
     for metric_name, results_matrix in all_results.items():
-        output_filename = os.path.join(output_dir, f"{resource_name}_{metric_name}.csv")
+        output_filename = os.path.join(output_dir, f"{resource_name[:3]}_{metric_name}.csv")
         with open(output_filename, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow([""] + languages)
@@ -244,23 +370,10 @@ def export_to_csv(conn, resource_name, output_dir):
                 writer.writerow([lang_row] + ["" if v is None else v for v in row_data])
 
 
-# --- Global storage for worker processes ---
-_worker_matrices = None
-
-def _init_worker(matrices):
-    """
-    Initializes the worker process with the read-only matrices.
-    This runs once per worker, not per task.
-    """
-    global _worker_matrices
-    _worker_matrices = matrices
-
-
-# --- Main Script (Refactored for DB) ---
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-
     resource_paths = glob.glob(os.path.join(LEXICA_DIR, "*"))
+
     for resource_path in resource_paths:
         if not os.path.isdir(resource_path):
             continue
@@ -268,12 +381,10 @@ def main():
         resource_name = os.path.basename(resource_path)
         print(f"Processing resource: {resource_name}...")
 
-        # --- 2. Load all language data (FIXED: Uses ThreadPoolExecutor) ---
+        # 1. Load Data
         language_data = {}
         lang_files = glob.glob(os.path.join(resource_path, "*.json"))
 
-        print(f"  Loading {len(lang_files)} language files...")
-        # Use ThreadPoolExecutor for I/O-bound tasks (this is the correct pool)
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = [executor.submit(_load_language_file, f) for f in lang_files]
             for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="  Loading data"):
@@ -282,95 +393,84 @@ def main():
                     language_data[lang_code] = sets_list
 
         if len(language_data) < 2:
-            print(f"  Not enough language data to compare for {resource_name}. Skipping.")
             continue
 
-        # --- 3. Pre-computation Step (Unchanged) ---
-        print("  Building global item universe...")
+        # 2. Build Universe
         global_universe = set()
         for sets_list in language_data.values():
             for s in sets_list: global_universe.update(s)
         n_items = len(global_universe)
-        if n_items == 0:
-            print("  No items found in resource. Skipping.")
-            continue
+        if n_items == 0: continue
         global_item_map = {item: i for i, item in enumerate(global_universe)}
 
-        print("  Pre-computing all language matrices...")
+        # 3. Build Matrices & Precompute Stats
+        print("  Building matrices and pre-computing stats...")
         language_matrices = {}
-        for lang_code, sets_list in tqdm(language_data.items(), desc="  Building matrices"):
-            language_matrices[lang_code] = _build_membership_matrix(sets_list, global_item_map)
-        del language_data, global_item_map  # Free memory
+        language_stats = {}
 
-        # --- NEW: 4. Database & Task Setup ---
+        for lang_code, sets_list in tqdm(language_data.items(), desc="  Matrix construction"):
+            # Build basic matrix
+            mat = _build_membership_matrix(sets_list, global_item_map)
+
+            # Convert to CSR immediately for efficient math operations later
+            mat_csr = mat.tocsr()
+            language_matrices[lang_code] = mat_csr
+
+            # Precompute invariants
+            language_stats[lang_code] = precompute_language_stats(mat_csr, n_items)
+
+        del language_data, global_item_map
+
+        # 4. Prepare DB
         languages = sorted(language_matrices.keys())
         db_path = os.path.join(OUTPUT_DIR, f"{resource_name}_cache.db")
-        print(f"  Opening database for checkpointing at {db_path}...")
         conn = sqlite3.connect(db_path)
-
-        # Create tables and add language list
         init_db(conn, languages)
-
-        # Load pairs we've already finished
         done_pairs = load_done_pairs(conn)
-        total_pairs = math.comb(len(languages), 2)
-        print(f"  Found {len(done_pairs)} / {total_pairs} existing results in DB.")
 
-        # --- 5. Compute metrics (PARALLELIZED with Queue) ---
-
-        # We need a Manager for a queue that can be shared by processes
+        # 5. Multiprocessing Execution
         with multiprocessing.Manager() as manager:
             queue = manager.Queue()
             tasks = []
 
-            # Build task list, skipping completed pairs
             for lang1, lang2 in itertools.combinations(languages, 2):
                 if tuple(sorted((lang1, lang2))) not in done_pairs:
-                    tasks.append((
-                        lang1,
-                        lang2,
-                        n_items,
-                        queue
-                    ))
+                    tasks.append((lang1, lang2, n_items, queue))
 
-            if not tasks:
-                print("  All comparisons are already computed.")
-            else:
-                print(f"  Preparing {len(tasks)} new comparison tasks...")
-                sys.stdout.flush()
+            if tasks:
+                max_cores = max(1, os.cpu_count() - 2)
+                print(f"  Processing {len(tasks)} pairs with {max_cores} cores...")
 
-                # Limit cores to leave 2 free, but always use at least 1
-                max_cores_to_use = max(1, os.cpu_count() - 4)
-                print(f"  Running with {max_cores_to_use} cores.")
+                batch_buffer = []
+                BATCH_SIZE = 200
+
                 with concurrent.futures.ProcessPoolExecutor(
-                        max_workers=max_cores_to_use,
+                        max_workers=max_cores,
                         initializer=_init_worker,
-                        initargs=(language_matrices,)
+                        initargs=(language_matrices, language_stats)
                 ) as executor:
-
                     futures = [executor.submit(_compute_pair, task) for task in tasks]
-                    # Start the listener loop
-                    # This loop pulls results from the queue as they come in
-                    # and saves them to the DB one by one.
-                    for _ in tqdm(range(len(tasks)), desc="  Processing metrics"):
-                        # Get next completed result from ANY worker
+
+                    # Consume queue
+                    for _ in tqdm(range(len(tasks)), desc="  Computing metrics"):
                         lang1, lang2, results = queue.get()
+                        batch_buffer.append((lang1, lang2, results))
 
-                        # Save this one result to the DB.
-                        # This is crash-safe.
-                        save_result_to_db(conn, lang1, lang2, results)
+                        if len(batch_buffer) >= BATCH_SIZE:
+                            save_batch_results(conn, batch_buffer)
+                            batch_buffer = []
 
-            print("Computation complete.")
+                    # Save remaining
+                    if batch_buffer:
+                        save_batch_results(conn, batch_buffer)
 
-        # --- NEW: 6. Final Export ---
-        print(f"  Exporting all matrices from DB to CSV files...")
+        print(f"  Exporting to CSV...")
         export_to_csv(conn, resource_name, OUTPUT_DIR)
-
-        # Close the database connection
         conn.close()
 
     print("Processing complete.")
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()

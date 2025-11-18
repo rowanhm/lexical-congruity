@@ -202,8 +202,8 @@ def main():
             df_patristic_dist.loc[gcode2, gcode1] = related
 
     # --- 4. Save to Files ---
-    dist_file = OUTPUT_DIR / 'physical_distance.csv'
-    rel_file = OUTPUT_DIR / 'patristic_distance.csv'  # Changed filename
+    dist_file = OUTPUT_DIR / 'dist_physical.csv'
+    rel_file = OUTPUT_DIR / 'dist_patristic.csv'
 
     print(f"Saving physical distance matrix to: {dist_file}")
     df_distance.to_csv(dist_file)

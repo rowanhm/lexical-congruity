@@ -9,14 +9,20 @@ from rpy2.robjects import conversion, default_converter
 CORES = 4
 ITERATIONS = 4000
 CHAINS = 4
+ALPHA = 0.05
 
 INDEPENDENT_VARIABLES = [
-    'patristic_distance',  # Independent Variable (X1)
-    'physical_distance',  # Independent Variable (X2)
-    'lexibank_omega'
+    'dist_patristic',  # Independent Variable (X1)
+    'dist_physical',  # Independent Variable (X2)
+    'lex_overlap'
 ]
 
-DEPENDENT_VAR = 'hofstede_euclidean_difference'
+DEPENDENT_VAR = 'hofstede_avg'
+
+# Calculate the probabilities for R
+prob_mass = 1 - ALPHA          # e.g., 0.95
+p_lower = ALPHA / 2            # e.g., 0.025
+p_upper = 1 - (ALPHA / 2)      # e.g., 0.975
 
 datasets = []
 
@@ -63,9 +69,6 @@ all_langs = pd.unique(combined[['l1', 'l2']].values.ravel('K'))
 combined['l1'] = pd.Categorical(combined['l1'], categories=all_langs)
 combined['l2'] = pd.Categorical(combined['l2'], categories=all_langs)
 
-print(f"Data Loaded. Found {len(combined)} overlapping pairs.")
-print(f"Total observations for model: {len(combined)}")
-
 print("Standardizing variables (Z-score)...")
 # Combine lists to scale both dependent and independent variables
 vars_to_scale = INDEPENDENT_VARIABLES + [DEPENDENT_VAR]
@@ -73,6 +76,9 @@ vars_to_scale = INDEPENDENT_VARIABLES + [DEPENDENT_VAR]
 for var in vars_to_scale:
     if var in combined.columns:
         combined[var] = (combined[var] - combined[var].mean()) / combined[var].std()
+
+print(f"Data Loaded. Found {len(combined)} overlapping pairs.")
+print(f"Total observations for model: {len(combined)}")
 
 # Define formula string for R
 formula = f"{DEPENDENT_VAR} ~ {' + '.join(['s(' + p + ')' for p in INDEPENDENT_VARIABLES])} + (1 | mm(l1, l2))"
@@ -89,11 +95,20 @@ model <- brm(
     backend = "cmdstanr",
     control = list(adapt_delta = 0.99)
 )
-summary(model)
-"""
 
-# Execute in R context
-print("Converting data to R object...")
+# 1. Fixed Effects
+# We pass the specific quantiles based on your Python ALPHA
+fixed_effects <- fixef(model, probs = c({p_lower}, {p_upper}))
+
+# 2. Smooth Terms
+# We pass the probability mass (e.g., 0.95)
+model_summary <- summary(model, prob = {prob_mass})
+smooth_terms <- model_summary$splines
+
+# 3. Bayesian R2
+r2_val <- bayes_R2(model)
+r2_mean <- mean(r2_val[,1])
+"""
 
 brms = importr('brms')
 
@@ -114,23 +129,6 @@ print(output)
 # ==========================================
 
 print("Extracting model results and statistics...")
-
-# Define R extraction code
-extraction_code = """
-# 1. Fixed Effects (Linear Trends)
-fixed_effects <- fixef(model)
-
-# 2. Smooth Terms (Curves/Wiggliness)
-model_summary <- summary(model)
-smooth_terms <- model_summary$splines
-
-# 3. Bayesian R2
-r2_val <- bayes_R2(model)
-r2_mean <- mean(r2_val[,1])
-"""
-
-# Run R extraction
-ro.r(extraction_code)
 
 # Bring data back to Python
 with (default_converter + pandas2ri.converter).context():
@@ -157,52 +155,44 @@ print(f"\n1. OVERALL MODEL FIT")
 print(f"   Bayesian R-squared: {r2_score:.4f}")
 print(f"   (Model explains {r2_score * 100:.1f}% of the variance)")
 
-print("\n2. LINEAR TRENDS (FIXED EFFECTS)")
-print("   (Directional effects: Positive = Increases difference, Negative = Decreases)")
+print(f"\n2. LINEAR TRENDS (FIXED EFFECTS) | Alpha: {ALPHA}")
 print("-" * 60)
 
 for index, row in fixed_df.iterrows():
-    # Clean name
     clean_name = index.replace('_', ' ').title()
-    if clean_name == "Intercept": continue  # Skip intercept for clarity in this list
+    if clean_name == "Intercept": continue
 
-    est = row['Estimate']
-    lower = row['Q2.5']
-    upper = row['Q97.5']
+    # Use integer location (.iloc) to avoid column name errors
+    # Col 0: Estimate, Col 1: Error, Col 2: Lower Bound, Col 3: Upper Bound
+    est = row.iloc[0]
+    lower = row.iloc[2]
+    upper = row.iloc[3]
 
-    # Significance: Does the interval cross zero?
+    # Check significance
     is_sig = (lower > 0 and upper > 0) or (lower < 0 and upper < 0)
     sig_tag = "[SIGNIFICANT]" if is_sig else "[Not Significant]"
 
     print(f"   * {clean_name}:")
     print(f"       Slope:      {est:.4f}")
-    print(f"       95% CI:     [{lower:.4f}, {upper:.4f}]")
+    print(f"       {(1-ALPHA)*100:.0f}% CI:     [{lower:.4f}, {upper:.4f}]")
     print(f"       Conclusion: {sig_tag}")
 
-print("\n3. NON-LINEAR PATTERNS (SMOOTH TERMS)")
-print("   (Magnitude of 'wiggliness' or complexity. Higher = More complex curve)")
+print(f"\n3. NON-LINEAR PATTERNS (SMOOTH TERMS) | Alpha: {ALPHA}")
 print("-" * 60)
 
 for index, row in smooth_df.iterrows():
-    # Clean name
     clean_name = index.replace('sds(', '').replace('s(', '').replace(')', '').replace('_', ' ').title()
 
-    est = row['Estimate']
-    lower = row['l-95% CI']
-    upper = row['u-95% CI']
+    # Use integer location (.iloc) here as well
+    est = row.iloc[0]
+    lower = row.iloc[2]
+    upper = row.iloc[3]
 
-    # Significance: Is the lower bound comfortably away from zero?
-    # We use > 0.01 as a threshold for "numerical significance"
+    # Significance check
     is_sig = lower > 0.01
     sig_tag = "[SIGNIFICANT]" if is_sig else "[Negligible]"
 
-    # Add nuance for borderline cases (like Omega might be)
-    if is_sig and lower < 0.05:
-        sig_tag += " (Borderline/Weak)"
-
     print(f"   * {clean_name}:")
     print(f"       Variation (SD): {est:.4f}")
-    print(f"       95% CI:         [{lower:.4f}, {upper:.4f}]")
+    print(f"       {(1-ALPHA)*100:.0f}% CI:     [{lower:.4f}, {upper:.4f}]")
     print(f"       Conclusion:     {sig_tag}")
-
-print("\n" + "=" * 60)
