@@ -60,12 +60,17 @@ def process_matrices(input_glob, output_file):
         vals_a = df_a_shared.values[indices]
         vals_b = df_b_shared.values[indices]
 
+        # Find indices where *both* arrays have valid (non-NaN) values
+        valid_indices = ~np.isnan(vals_a) & ~np.isnan(vals_b)
+        vals_a_clean = vals_a[valid_indices]
+        vals_b_clean = vals_b[valid_indices]
+
         correlation = np.nan
-        # Ensure there are at least 2 values to correlate
-        if vals_a.size > 1:
+        # Ensure there are at least 2 valid (non-NaN) pairs to correlate
+        if vals_a_clean.size > 1:
             try:
-                # Calculate Spearman correlation
-                corr, _ = spearmanr(vals_a, vals_b)
+                # Calculate Spearman correlation on the cleaned data
+                corr, _ = spearmanr(vals_a_clean, vals_b_clean)
                 if not np.isnan(corr):
                     correlation = corr
             except ValueError as e:
