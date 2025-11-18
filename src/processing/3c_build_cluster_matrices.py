@@ -114,21 +114,25 @@ def _load_language_file(lang_file):
         return lang_code, None
 
 
-# --- MODIFIED: Worker now sends results to a Queue ---
 def _compute_pair(task_data):
     """
     Worker function: Computes metrics and PUTS the result into the shared queue.
     """
-    lang1, lang2, M1, M2, n_items, queue = task_data
+    # CHANGE: Unpack only keys and metadata (M1/M2 are removed from arguments)
+    lang1, lang2, n_items, queue = task_data
+
+    # CHANGE: Retrieve heavy matrices from global worker storage
+    M1 = _worker_matrices[lang1]
+    M2 = _worker_matrices[lang2]
+
     try:
         results = compute_all_metrics_from_matrices(M1, M2, n_items)
     except Exception as e:
         print(f"Error computing metrics for {lang1}-{lang2}: {e}")
         results = {metric: math.nan for metric in METRICS}
 
-    # Put the result on the queue instead of returning it
     queue.put((lang1, lang2, results))
-    return True  # Return a simple success signal
+    return True
 
 
 # --- NEW: Database Helper Functions ---
@@ -240,12 +244,23 @@ def export_to_csv(conn, resource_name, output_dir):
                 writer.writerow([lang_row] + ["" if v is None else v for v in row_data])
 
 
+# --- Global storage for worker processes ---
+_worker_matrices = None
+
+def _init_worker(matrices):
+    """
+    Initializes the worker process with the read-only matrices.
+    This runs once per worker, not per task.
+    """
+    global _worker_matrices
+    _worker_matrices = matrices
+
+
 # --- Main Script (Refactored for DB) ---
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     resource_paths = glob.glob(os.path.join(LEXICA_DIR, "*"))
-    resource_paths = [resource_paths[0]]
     for resource_path in resource_paths:
         if not os.path.isdir(resource_path):
             continue
@@ -311,11 +326,12 @@ def main():
             # Build task list, skipping completed pairs
             for lang1, lang2 in itertools.combinations(languages, 2):
                 if tuple(sorted((lang1, lang2))) not in done_pairs:
-                    tasks.append((lang1, lang2,
-                                  language_matrices[lang1],
-                                  language_matrices[lang2],
-                                  n_items,
-                                  queue))  # Pass the queue to the worker
+                    tasks.append((
+                        lang1,
+                        lang2,
+                        n_items,
+                        queue
+                    ))
 
             if not tasks:
                 print("  All comparisons are already computed.")
@@ -326,11 +342,13 @@ def main():
                 # Limit cores to leave 2 free, but always use at least 1
                 max_cores_to_use = max(1, os.cpu_count() - 4)
                 print(f"  Running with {max_cores_to_use} cores.")
-                with concurrent.futures.ProcessPoolExecutor(max_workers=max_cores_to_use) as executor:
+                with concurrent.futures.ProcessPoolExecutor(
+                        max_workers=max_cores_to_use,
+                        initializer=_init_worker,
+                        initargs=(language_matrices,)
+                ) as executor:
 
-                    # Submit all tasks
                     futures = [executor.submit(_compute_pair, task) for task in tasks]
-
                     # Start the listener loop
                     # This loop pulls results from the queue as they come in
                     # and saves them to the DB one by one.
